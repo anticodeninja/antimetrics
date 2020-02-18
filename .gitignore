@@ -1,0 +1,7 @@
+.idea/
+packages/
+bin/
+obj/
+etw-man/*[rc|res|dll]
+*.user
+*.DotSettings
