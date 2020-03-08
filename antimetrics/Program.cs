@@ -10,6 +10,8 @@ namespace Antimetrics
     using System.Diagnostics;
     using System.Linq;
     using System.Threading;
+
+    using AntiFramework;
     using InfluxDB.Collector;
     using Microsoft.Diagnostics.Tracing.Parsers;
     using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
@@ -81,11 +83,11 @@ namespace Antimetrics
 
         #region Fields
 
-        private readonly string _influxAddress;
-
         private readonly Dictionary<string, ProcessState> _monitoredProcesses;
 
         private readonly Dictionary<int, ProcessState> _activeProcesses;
+
+        private string _influxAddress;
 
         private long _nextReport;
 
@@ -95,19 +97,9 @@ namespace Antimetrics
 
         #region Constructors
 
-        private Program(string[] args)
+        private Program()
         {
-            _influxAddress = args[0];
-
             _monitoredProcesses = new Dictionary<string, ProcessState>();
-            for (var i = 1; i < args.Length; ++i)
-            {
-                _monitoredProcesses[args[i]] = new ProcessState()
-                {
-                    Pid = FORBIDDEN_ID,
-                    Name = args[i],
-                };
-            }
             _activeProcesses = new Dictionary<int, ProcessState>();
         }
 
@@ -115,11 +107,34 @@ namespace Antimetrics
 
         #region Methods
 
-        static void Main(string[] args) => new Program(args).Run();
+        static void Main(string[] args) => new Program().Run(args);
 
-        void Run()
+        void Run(string[] args)
         {
+            var result = new ArgsParser(args)
+                .Help("?", "help")
+                .Comment("antimetrics is an application for a process health metrics collection (like cpu and memory consumptions) via API and ETW\n" +
+                         "counters and publishing them into an database for further analyses.")
+                .Keys("h", "host").Tip("address of InfluxDatabase").Value(out _influxAddress, "http://127.0.0.1:8086")
+                .Name("process").Amount(1, int.MaxValue).Tip("list of process names for monitoring").Values<string>(out var processes)
+                .Result();
+
+            if (result != null)
+            {
+                Console.WriteLine(result);
+                return;
+            }
+
             Process.EnterDebugMode();
+
+            for (var i = 0; i < processes.Count; ++i)
+            {
+                _monitoredProcesses[processes[i]] = new ProcessState()
+                {
+                    Pid = FORBIDDEN_ID,
+                    Name = processes[i],
+                };
+            }
 
             foreach (var process in _monitoredProcesses.Values)
             {
@@ -141,6 +156,10 @@ namespace Antimetrics
                     process.Pid = process.Process.Id;
                     _activeProcesses[process.Pid] = process;
                     Console.WriteLine("Process {0} is already active, pid {1}", process.Name, process.Pid);
+                }
+                else
+                {
+                    Console.WriteLine("Process {0} is not found, waiting...", process.Name);
                 }
             }
 
@@ -356,7 +375,6 @@ namespace Antimetrics
                 // Thread Statistics
                 var threadMin = double.PositiveInfinity;
                 var threadMax = 0.0;
-                var count = 0;
                 var active = 0;
 
                 var deadThreads = new HashSet<int>();
