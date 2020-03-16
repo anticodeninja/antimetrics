@@ -9,10 +9,13 @@ namespace Antimetrics
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
+    using System.Net;
+    using System.Net.Http;
     using System.Threading;
 
     using AntiFramework;
     using InfluxDB.Collector;
+    using InfluxDB.Collector.Diagnostics;
     using Microsoft.Diagnostics.Tracing.Parsers;
     using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
     using Microsoft.Diagnostics.Tracing.Session;
@@ -79,6 +82,13 @@ namespace Antimetrics
             public double StartTime;
         }
 
+        class NoProxy : IWebProxy
+        {
+            public Uri GetProxy(Uri destination) => throw new InvalidOperationException();
+            public bool IsBypassed(Uri host) => true;
+            public ICredentials Credentials { get; set; }
+        }
+
         #endregion Classes
 
         #region Fields
@@ -87,7 +97,7 @@ namespace Antimetrics
 
         private readonly Dictionary<int, ProcessState> _activeProcesses;
 
-        private string _influxAddress;
+        private int _verbose;
 
         private long _nextReport;
 
@@ -115,7 +125,9 @@ namespace Antimetrics
                 .Help("?", "help")
                 .Comment("antimetrics is an application for a process health metrics collection (like cpu and memory consumptions) via API and ETW\n" +
                          "counters and publishing them into an database for further analyses.")
-                .Keys("h", "host").Tip("address of InfluxDatabase").Value(out _influxAddress, "http://127.0.0.1:8086")
+                .Keys("h", "host").Tip("address of InfluxDatabase").Value(out var influxAddress, "http://127.0.0.1:8086")
+                .Keys("v", "verbose").Tip("increase output verbosity").Flag(out _verbose)
+                .Keys("no-proxy").Tip("disable proxy usage").Flag(out var noProxy)
                 .Name("process").Amount(1, int.MaxValue).Tip("list of process names for monitoring").Values<string>(out var processes)
                 .Result();
 
@@ -126,6 +138,9 @@ namespace Antimetrics
             }
 
             Process.EnterDebugMode();
+            if (noProxy > 0)
+                HttpClient.DefaultProxy = new NoProxy();
+            CollectorLog.RegisterErrorHandler((message, exception) => Console.WriteLine($"{message}: {exception}"));
 
             for (var i = 0; i < processes.Count; ++i)
             {
@@ -147,7 +162,7 @@ namespace Antimetrics
                     .Tag.With("host", Environment.GetEnvironmentVariable("COMPUTERNAME"))
                     .Tag.With("app", process.Name)
                     .Batch.AtInterval(TimeSpan.FromSeconds(5))
-                    .WriteTo.InfluxDB(_influxAddress, DB_NAME)
+                    .WriteTo.InfluxDB(influxAddress, DB_NAME)
                     .CreateCollector();
 
                 process.Process = Process.GetProcesses().FirstOrDefault(x => x.ProcessName == process.Name);
@@ -416,6 +431,8 @@ namespace Antimetrics
                 metrics["working_set"] = process.WorkingSet;
                 metrics["private_memory_size"] = process.PrivateMemorySize;
 
+                if (_verbose >= 1)
+                    Console.WriteLine(string.Join(",", metrics.Select(kv => kv.Key + "=" + kv.Value)));
                 process.Collector.Write(DB_NAME, metrics);
             }
 
