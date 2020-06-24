@@ -6,18 +6,17 @@
 namespace Antimetrics
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
-    using System.Net;
     using System.Net.Http;
     using System.Threading;
 
-    using AntiFramework;
+    using AntiFramework.Utils;
     using InfluxDB.Collector;
     using InfluxDB.Collector.Diagnostics;
     using Microsoft.Diagnostics.Tracing.Parsers;
-    using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
     using Microsoft.Diagnostics.Tracing.Session;
 
     class Program
@@ -27,6 +26,8 @@ namespace Antimetrics
         private const int FORBIDDEN_ID = -1;
 
         private const int REP_INTERVAL = 1000;
+
+        private const int DOUBLE_PRECISION = 1000;
 
         private const int DEAD_THRESHOLD = 10;
 
@@ -38,57 +39,6 @@ namespace Antimetrics
 
         #region Classes
 
-        class ProcessState
-        {
-            public string Name;
-
-            public int Pid;
-
-            public Process Process;
-
-            public MetricsCollector Collector;
-
-            public double[] Concurrency;
-            public double ConcurrencyLast;
-            public int ConcurrencyCounter;
-            public Dictionary<int, ThreadState> Threads;
-
-            public long WriteBytes;
-            public long WriteCalls;
-            public long ReadBytes;
-            public long ReadCalls;
-
-            public long TcpSentBytes;
-            public long TcpSentPackets;
-            public long TcpRecvBytes;
-            public long TcpRecvPackets;
-
-            public long UdpSentBytes;
-            public long UdpSentPackets;
-            public long UdpRecvBytes;
-            public long UdpRecvPackets;
-
-            public long ThreadsCount;
-            public long HandlesCount;
-            public long WorkingSet;
-            public long PrivateMemorySize;
-        }
-
-        class ThreadState
-        {
-            public bool Active;
-            public long ReportId;
-            public double TotalTime;
-            public double StartTime;
-        }
-
-        class NoProxy : IWebProxy
-        {
-            public Uri GetProxy(Uri destination) => throw new InvalidOperationException();
-            public bool IsBypassed(Uri host) => true;
-            public ICredentials Credentials { get; set; }
-        }
-
         #endregion Classes
 
         #region Fields
@@ -99,8 +49,9 @@ namespace Antimetrics
 
         private int _verbose;
 
-        private long _nextReport;
+        private long _lastSwitchReport;
 
+        private long _nextReport;
         private int _reportId;
 
         #endregion Fields
@@ -139,24 +90,36 @@ namespace Antimetrics
 
             Process.EnterDebugMode();
             if (noProxy > 0)
-                HttpClient.DefaultProxy = new NoProxy();
+                HttpClient.DefaultProxy = new DisableSystemProxy();
             CollectorLog.RegisterErrorHandler((message, exception) => Console.WriteLine($"{message}: {exception}"));
 
             for (var i = 0; i < processes.Count; ++i)
             {
-                _monitoredProcesses[processes[i]] = new ProcessState()
+                if (FindProcessByPid(processes[i], out var process))
                 {
-                    Pid = FORBIDDEN_ID,
-                    Name = processes[i],
-                };
+                    _monitoredProcesses[processes[i]] = new ProcessState
+                    {
+                        Pid = process.Id,
+                        Name = process.ProcessName,
+                        Process = process,
+                    };
+                }
+                else
+                {
+                    _monitoredProcesses[processes[i]] = new ProcessState
+                    {
+                        Pid = FORBIDDEN_ID,
+                        Name = processes[i],
+                    };
+                }
             }
 
             foreach (var process in _monitoredProcesses.Values)
             {
-                process.Concurrency = new double[Environment.ProcessorCount + 1];
-                process.ConcurrencyLast = 0.0;
+                process.Concurrency = new long[Environment.ProcessorCount + 1];
+                process.ConcurrencyLast = 0;
                 process.ConcurrencyCounter = 0;
-                process.Threads = new Dictionary<int, ThreadState>();
+                process.Threads = new ConcurrentDictionary<int, ThreadState>();
 
                 process.Collector = new CollectorConfiguration()
                     .Tag.With("host", Environment.GetEnvironmentVariable("COMPUTERNAME"))
@@ -165,7 +128,7 @@ namespace Antimetrics
                     .WriteTo.InfluxDB(influxAddress, DB_NAME)
                     .CreateCollector();
 
-                process.Process = Process.GetProcesses().FirstOrDefault(x => x.ProcessName == process.Name);
+                process.Process ??= Process.GetProcesses().FirstOrDefault(x => x.ProcessName == process.Name);
                 if (process.Process != null)
                 {
                     process.Pid = process.Process.Id;
@@ -178,35 +141,27 @@ namespace Antimetrics
                 }
             }
 
-            _nextReport = Environment.TickCount + REP_INTERVAL;
+            _nextReport = Environment.TickCount64 + REP_INTERVAL;
             _reportId = 0;
 
             // ETW works quite unstable for PerformanceCounters and MemInfo events, so get them through good old API
-            var apiTimer = new Timer(state =>
+            var apiCollector = new Thread(ApiCollector)
             {
-                foreach (var process in _monitoredProcesses.Values)
-                {
-                    try
-                    {
-                        if (process.Pid == FORBIDDEN_ID)
-                            continue;
+                Name = "API Collector"
+            };
+            apiCollector.Start();
 
-                        if (process.Process == null || process.Process.Id != process.Pid)
-                            process.Process = Process.GetProcessById(process.Pid);
+            var etwCollector = new Thread(EtwCollector)
+            {
+                Name = "ETW Collector"
+            };
+            etwCollector.Start();
 
-                        process.Process.Refresh();
-                        process.ThreadsCount = process.Process.Threads.Count;
-                        process.HandlesCount = process.Process.HandleCount;
-                        process.WorkingSet = process.Process.WorkingSet64;
-                        process.PrivateMemorySize = process.Process.PrivateMemorySize64;
-                    }
-                    catch (Exception e)
-                    {
-                        Console.WriteLine(e);
-                    }
-                }
-            }, null, 0, REP_INTERVAL);
+            MainWorker();
+        }
 
+        private void EtwCollector()
+        {
             using (var session = new TraceEventSession("antimetrics"))
             {
                 session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process |
@@ -216,7 +171,7 @@ namespace Antimetrics
                                              KernelTraceEventParser.Keywords.ContextSwitch |
                                              KernelTraceEventParser.Keywords.FileIOInit);
 
-                void SwitchOn(ProcessState process, int threadId, double timestamp)
+                void SwitchOn(ProcessState process, int threadId, long timestamp)
                 {
                     process.Concurrency[process.ConcurrencyCounter] += timestamp - process.ConcurrencyLast;
                     process.ConcurrencyLast = timestamp;
@@ -233,7 +188,7 @@ namespace Antimetrics
                     thread.ReportId = _reportId;
                 }
 
-                void SwitchOff(ProcessState process, int threadId, double timestamp)
+                void SwitchOff(ProcessState process, int threadId, long timestamp)
                 {
                     process.Concurrency[process.ConcurrencyCounter] += timestamp - process.ConcurrencyLast;
                     process.ConcurrencyLast = timestamp;
@@ -271,17 +226,16 @@ namespace Antimetrics
                     process.ConcurrencyCounter = 0;
                 };
 
-                session.Source.Kernel.ThreadStart += e =>
-                {
-                };
+                session.Source.Kernel.ThreadStart += e => { };
 
                 session.Source.Kernel.ThreadStop += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
 
-                    SwitchOff(process, e.ThreadID, e.TimeStampRelativeMSec);
-                    process.Threads.Remove(e.ThreadID);
+                    var timestamp = (long)(e.TimeStampRelativeMSec * DOUBLE_PRECISION);
+                    SwitchOff(process, e.ThreadID, timestamp);
+                    process.Threads.Remove(e.ThreadID, out _);
                 };
 
                 session.Source.Kernel.FileIORead += e =>
@@ -340,104 +294,146 @@ namespace Antimetrics
 
                 session.Source.Kernel.ThreadCSwitch += e =>
                 {
+                    var timestamp = (long)(e.TimeStampRelativeMSec * DOUBLE_PRECISION);
                     if (_activeProcesses.TryGetValue(e.OldProcessID, out var oldProcess))
-                        SwitchOff(oldProcess, e.OldThreadID, e.TimeStampRelativeMSec);
+                        SwitchOff(oldProcess, e.OldThreadID, timestamp);
                     if (_activeProcesses.TryGetValue(e.ProcessID, out var process))
-                        SwitchOn(process, e.ThreadID, e.TimeStampRelativeMSec);
-
-                    if (Environment.TickCount > _nextReport)
-                        GenerateReport(e);
+                        SwitchOn(process, e.ThreadID, timestamp);
+                    Interlocked.Exchange(ref _lastSwitchReport, timestamp);
                 };
 
                 session.Source.Process();
             }
         }
 
-        private void GenerateReport(CSwitchTraceData e)
+        private void ApiCollector()
         {
-            foreach (var process in _monitoredProcesses.Values)
+            for (;;)
             {
-                var metrics = new Dictionary<string, object>
+                foreach (var process in _monitoredProcesses.Values)
                 {
-                    ["write_bytes"] = TakeAndReset(ref process.WriteBytes),
-                    ["write_calls"] = TakeAndReset(ref process.WriteCalls),
-                    ["read_bytes"] = TakeAndReset(ref process.ReadBytes),
-                    ["read_calls"] = TakeAndReset(ref process.ReadCalls),
-                    ["tcp_sent_bytes"] = TakeAndReset(ref process.TcpSentBytes),
-                    ["tcp_sent_packets"] = TakeAndReset(ref process.TcpSentPackets),
-                    ["tcp_recv_bytes"] = TakeAndReset(ref process.TcpRecvBytes),
-                    ["tcp_recv_packets"] = TakeAndReset(ref process.TcpRecvPackets),
-                    ["udp_sent_bytes"] = TakeAndReset(ref process.UdpSentBytes),
-                    ["udp_sent_packets"] = TakeAndReset(ref process.UdpSentPackets),
-                    ["udp_recv_bytes"] = TakeAndReset(ref process.UdpRecvBytes),
-                    ["udp_recv_packets"] = TakeAndReset(ref process.UdpRecvPackets)
-                };
+                    try
+                    {
+                        if (process.Pid == FORBIDDEN_ID)
+                            continue;
 
-                // CPU Statistics
-                var procTimeTotal = 0.0;
-                var procTimeTotalAnti = 0.0;
-                for (var i = 1; i < process.Concurrency.Length; ++i)
-                {
-                    procTimeTotal += i * process.Concurrency[i];
-                    procTimeTotalAnti += process.Concurrency[i];
-                    metrics[$"cpu_{i}"] = process.Concurrency[i] / REP_INTERVAL * 100;
+                        if ((process.Process == null || process.Process.Id != process.Pid) && !FindProcessByPid(process.Pid, out process.Process))
+                            continue;
+
+                        process.Process.Refresh();
+
+                        process.ThreadsCount = process.Process.Threads.Count;
+                        process.HandlesCount = process.Process.HandleCount;
+                        process.WorkingSet = process.Process.WorkingSet64;
+                        process.PrivateMemorySize = process.Process.PrivateMemorySize64;
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e);
+                    }
                 }
 
-                metrics["cpu_ratio"] = procTimeTotal / REP_INTERVAL / Environment.ProcessorCount * 100;
-                metrics["cpu_antiratio"] = procTimeTotalAnti / REP_INTERVAL * 100;
-                Array.Clear(process.Concurrency, 0, process.Concurrency.Length);
-
-                // Thread Statistics
-                var threadMin = double.PositiveInfinity;
-                var threadMax = 0.0;
-                var active = 0;
-
-                var deadThreads = new HashSet<int>();
-                foreach (var entry in process.Threads)
-                {
-                    // Sometimes ETW can skip events, so add bunch of crutches to handle it
-                    if (_reportId >= entry.Value.ReportId + DEAD_THRESHOLD)
-                    {
-                        deadThreads.Add(entry.Key);
-                        continue;
-                    }
-
-                    if (entry.Value.Active)
-                    {
-                        entry.Value.TotalTime += e.TimeStampRelativeMSec - entry.Value.StartTime;
-                        entry.Value.StartTime = e.TimeStampRelativeMSec;
-                    }
-
-                    if (entry.Value.TotalTime > TOLERANCE)
-                    {
-                        threadMin = Math.Min(threadMin, entry.Value.TotalTime);
-                        threadMax = Math.Max(threadMax, entry.Value.TotalTime);
-                        active += 1;
-                    }
-
-                    entry.Value.TotalTime = 0.0;
-                }
-
-                foreach (var entry in deadThreads)
-                    process.Threads.Remove(entry);
-
-                metrics["threads_count"] = process.ThreadsCount;
-                metrics["threads_active"] = active;
-                metrics["threads_dur_min"] = !double.IsPositiveInfinity(threadMin) ? threadMin : 0.0;
-                metrics["threads_dur_aver"] = procTimeTotal / active;
-                metrics["threads_dur_max"] = threadMax;
-
-                metrics["handles"] = process.HandlesCount;
-                metrics["working_set"] = process.WorkingSet;
-                metrics["private_memory_size"] = process.PrivateMemorySize;
-
-                if (_verbose >= 1)
-                    Console.WriteLine(string.Join(",", metrics.Select(kv => kv.Key + "=" + kv.Value)));
-                process.Collector.Write(DB_NAME, metrics);
+                Thread.Sleep(REP_INTERVAL);
             }
+        }
 
-            _reportId += 1;
-            _nextReport += REP_INTERVAL;
+        private void MainWorker()
+        {
+            for (;;)
+            {
+                var delta = _nextReport - Environment.TickCount64;
+                if (delta > REP_INTERVAL)
+                    _nextReport = Environment.TickCount64;
+                else if (delta > 0)
+                    Thread.Sleep((int) delta);
+                _nextReport += REP_INTERVAL;
+
+                foreach (var process in _monitoredProcesses.Values)
+                {
+                    if (process.Process == null)
+                        continue;
+
+                    var metrics = new Dictionary<string, object>
+                    {
+                        ["write_bytes"] = TakeAndReset(ref process.WriteBytes),
+                        ["write_calls"] = TakeAndReset(ref process.WriteCalls),
+                        ["read_bytes"] = TakeAndReset(ref process.ReadBytes),
+                        ["read_calls"] = TakeAndReset(ref process.ReadCalls),
+                        ["tcp_sent_bytes"] = TakeAndReset(ref process.TcpSentBytes),
+                        ["tcp_sent_packets"] = TakeAndReset(ref process.TcpSentPackets),
+                        ["tcp_recv_bytes"] = TakeAndReset(ref process.TcpRecvBytes),
+                        ["tcp_recv_packets"] = TakeAndReset(ref process.TcpRecvPackets),
+                        ["udp_sent_bytes"] = TakeAndReset(ref process.UdpSentBytes),
+                        ["udp_sent_packets"] = TakeAndReset(ref process.UdpSentPackets),
+                        ["udp_recv_bytes"] = TakeAndReset(ref process.UdpRecvBytes),
+                        ["udp_recv_packets"] = TakeAndReset(ref process.UdpRecvPackets)
+                    };
+
+                    // CPU Statistics
+                    var procTimeTotal = 0L;
+                    var procTimeTotalAnti = 0L;
+                    for (var i = 1; i < process.Concurrency.Length; ++i)
+                    {
+                        procTimeTotal += i * process.Concurrency[i];
+                        procTimeTotalAnti += process.Concurrency[i];
+                        metrics[$"cpu_{i}"] = (double) process.Concurrency[i] / DOUBLE_PRECISION / REP_INTERVAL * 100;
+                    }
+
+                    metrics["cpu_ratio"] = (double) procTimeTotal / DOUBLE_PRECISION / REP_INTERVAL / Environment.ProcessorCount * 100;
+                    metrics["cpu_antiratio"] = (double) procTimeTotalAnti / DOUBLE_PRECISION / REP_INTERVAL * 100;
+                    Array.Clear(process.Concurrency, 0, process.Concurrency.Length);
+
+                    // Thread Statistics
+                    var threadMin = double.PositiveInfinity;
+                    var threadMax = 0.0;
+                    var active = 0;
+
+                    var deadThreads = new HashSet<int>();
+                    foreach (var entry in process.Threads)
+                    {
+                        // Sometimes ETW can skip events, so add bunch of crutches to handle it
+                        if (_reportId >= entry.Value.ReportId + DEAD_THRESHOLD)
+                        {
+                            deadThreads.Add(entry.Key);
+                            continue;
+                        }
+
+                        if (entry.Value.Active)
+                        {
+                            entry.Value.TotalTime += _lastSwitchReport - entry.Value.StartTime;
+                            entry.Value.StartTime = _lastSwitchReport;
+                        }
+
+                        if (entry.Value.TotalTime > TOLERANCE)
+                        {
+                            threadMin = Math.Min(threadMin, entry.Value.TotalTime);
+                            threadMax = Math.Max(threadMax, entry.Value.TotalTime);
+                            active += 1;
+                        }
+
+                        entry.Value.TotalTime = 0.0;
+                    }
+
+                    foreach (var entry in deadThreads)
+                        process.Threads.Remove(entry, out _);
+
+                    metrics["threads_count"] = process.ThreadsCount;
+                    metrics["threads_active"] = active;
+                    metrics["threads_dur_min"] = !double.IsPositiveInfinity(threadMin) ? threadMin : 0.0;
+                    metrics["threads_dur_aver"] = active > 0 ? (double) procTimeTotal / DOUBLE_PRECISION / active : 0.0;
+                    metrics["threads_dur_max"] = threadMax;
+
+                    metrics["handles"] = process.HandlesCount;
+                    metrics["working_set"] = process.WorkingSet;
+                    metrics["private_memory_size"] = process.PrivateMemorySize;
+
+                    if (_verbose >= 1)
+                        Console.WriteLine(string.Join(",", metrics.Select(kv => kv.Key + "=" + kv.Value)));
+                    process.Collector.Write(DB_NAME, metrics);
+                }
+
+                _reportId += 1;
+            }
         }
 
         private static long TakeAndReset(ref long metric)
@@ -445,6 +441,30 @@ namespace Antimetrics
             var temp = metric;
             metric = 0;
             return temp;
+        }
+
+        private static bool FindProcessByPid(string pid, out Process process)
+        {
+            process = null;
+            if (!int.TryParse(pid, out var value))
+                return  false;
+
+            return FindProcessByPid(value, out process);
+        }
+
+        private static bool FindProcessByPid(int pid, out Process process)
+        {
+            process = null;
+
+            try
+            {
+                process = Process.GetProcessById(pid);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         #endregion Methods
