@@ -2,6 +2,12 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "antimetrics", "antimetrics\antimetrics.csproj", "{61E1BABF-B339-4EC1-8320-3607EFEBD73F}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "antidbg", "antidbg\antidbg.csproj", "{7D2AEF5A-F21D-4B02-B2E5-22F2CD6F76BD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "antidbg64", "antidbg64\antidbg64.csproj", "{1FD1F862-B1DB-4C83-9958-1C1EFE37F65C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "antidbg86", "antidbg86\antidbg86.csproj", "{8BC02A01-B77D-4F8A-A7E4-2773A1D33A7C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +18,17 @@ Global
 		{61E1BABF-B339-4EC1-8320-3607EFEBD73F}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{61E1BABF-B339-4EC1-8320-3607EFEBD73F}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{61E1BABF-B339-4EC1-8320-3607EFEBD73F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7D2AEF5A-F21D-4B02-B2E5-22F2CD6F76BD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7D2AEF5A-F21D-4B02-B2E5-22F2CD6F76BD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7D2AEF5A-F21D-4B02-B2E5-22F2CD6F76BD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7D2AEF5A-F21D-4B02-B2E5-22F2CD6F76BD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8BC02A01-B77D-4F8A-A7E4-2773A1D33A7C}.Debug|Any CPU.ActiveCfg = Debug|x86
+		{8BC02A01-B77D-4F8A-A7E4-2773A1D33A7C}.Debug|Any CPU.Build.0 = Debug|x86
+		{8BC02A01-B77D-4F8A-A7E4-2773A1D33A7C}.Release|Any CPU.ActiveCfg = Release|x86
+		{8BC02A01-B77D-4F8A-A7E4-2773A1D33A7C}.Release|Any CPU.Build.0 = Release|x86
+		{1FD1F862-B1DB-4C83-9958-1C1EFE37F65C}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{1FD1F862-B1DB-4C83-9958-1C1EFE37F65C}.Debug|Any CPU.Build.0 = Debug|x64
+		{1FD1F862-B1DB-4C83-9958-1C1EFE37F65C}.Release|Any CPU.ActiveCfg = Release|x64
+		{1FD1F862-B1DB-4C83-9958-1C1EFE37F65C}.Release|Any CPU.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal

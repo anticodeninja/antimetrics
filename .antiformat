@@ -1,0 +1,13 @@
+config:
+  rstrip: True
+variables:
+  author: "Artem Yamshanov, me [at] anticode.ninja"
+  years: "2020"
+global:
+  header: |
+      {mpl2_header}
+      Copyright {years} {author}
+files:
+  "*.cs": {}
+ignore:
+- "*/obj/*"

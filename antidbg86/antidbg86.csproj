@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>netcoreapp3.1</TargetFramework>
+        <Configurations>Release;Debug</Configurations>
+        <Platforms>x86</Platforms>
+        <AssemblyName>antidbg.x86</AssemblyName>
+        <OutDir>$(SolutionDir)bin\</OutDir>
+        <RootNamespace>antidbg86</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\antidbg\antidbg.csproj" />
+    </ItemGroup>
+
+</Project>

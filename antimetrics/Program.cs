@@ -1,4 +1,4 @@
-﻿// This Source Code Form is subject to the terms of the
+// This Source Code Form is subject to the terms of the
 // Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed
 // with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
 // Copyright 2020 Artem Yamshanov, me [at] anticode.ninja
@@ -9,10 +9,11 @@ namespace Antimetrics
     using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using System.IO;
     using System.Linq;
     using System.Net.Http;
+    using System.Runtime.InteropServices;
     using System.Threading;
-
     using AntiFramework.Utils;
     using InfluxDB.Collector;
     using InfluxDB.Collector.Diagnostics;
@@ -49,10 +50,15 @@ namespace Antimetrics
 
         private int _verbose;
 
+        private TraceEventSession _session;
         private long _lastSwitchReport;
 
         private long _nextReport;
         private int _reportId;
+
+        private string _dumpsDirectory;
+
+        private bool _active;
 
         #endregion Fields
 
@@ -72,13 +78,21 @@ namespace Antimetrics
 
         void Run(string[] args)
         {
+            AppDomain.CurrentDomain.ProcessExit += (sender, eventArgs) => _active = false;
+            Console.CancelKeyPress += (sender, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                _active = false;
+            };
+
             var result = new ArgsParser(args)
                 .Help("?", "help")
                 .Comment("antimetrics is an application for a process health metrics collection (like cpu and memory consumptions) via API and ETW\n" +
                          "counters and publishing them into an database for further analyses.")
-                .Keys("h", "host").Tip("address of InfluxDatabase").Value(out var influxAddress, "http://127.0.0.1:8086")
                 .Keys("v", "verbose").Tip("increase output verbosity").Flag(out _verbose)
                 .Keys("no-proxy").Tip("disable proxy usage").Flag(out var noProxy)
+                .Keys("with-influx").Tip("enable influx usage and set its address (ex. http://127.0.0.1:8086)").Value<string>(out var influxAddress, null)
+                .Keys("with-dumps").Tip("enable auto dumping and set its directory (ex. C:\\dumps)").Value<string>(out _dumpsDirectory, null)
                 .Name("process").Amount(1, int.MaxValue).Tip("list of process names for monitoring").Values<string>(out var processes)
                 .Result();
 
@@ -88,10 +102,13 @@ namespace Antimetrics
                 return;
             }
 
-            Process.EnterDebugMode();
             if (noProxy > 0)
                 HttpClient.DefaultProxy = new DisableSystemProxy();
-            CollectorLog.RegisterErrorHandler((message, exception) => Console.WriteLine($"{message}: {exception}"));
+            CollectorLog.RegisterErrorHandler((message, exception) =>
+            {
+                if (_verbose >= 1)
+                    Console.WriteLine($"{message}: {exception}");
+            });
 
             for (var i = 0; i < processes.Count; ++i)
             {
@@ -121,19 +138,22 @@ namespace Antimetrics
                 process.ConcurrencyCounter = 0;
                 process.Threads = new ConcurrentDictionary<int, ThreadState>();
 
-                process.Collector = new CollectorConfiguration()
-                    .Tag.With("host", Environment.GetEnvironmentVariable("COMPUTERNAME"))
-                    .Tag.With("app", process.Name)
-                    .Batch.AtInterval(TimeSpan.FromSeconds(5))
-                    .WriteTo.InfluxDB(influxAddress, DB_NAME)
-                    .CreateCollector();
+                if (influxAddress != null)
+                {
+                    process.Collector = new CollectorConfiguration()
+                        .Tag.With("host", Environment.GetEnvironmentVariable("COMPUTERNAME"))
+                        .Tag.With("app", process.Name)
+                        .Batch.AtInterval(TimeSpan.FromSeconds(5))
+                        .WriteTo.InfluxDB(influxAddress, DB_NAME)
+                        .CreateCollector();
+                }
 
                 process.Process ??= Process.GetProcesses().FirstOrDefault(x => x.ProcessName == process.Name);
                 if (process.Process != null)
                 {
+                    Console.WriteLine("Process {0} is already active, pid {1}", process.Name, process.Process.Id);
                     process.Pid = process.Process.Id;
                     _activeProcesses[process.Pid] = process;
-                    Console.WriteLine("Process {0} is already active, pid {1}", process.Name, process.Pid);
                 }
                 else
                 {
@@ -144,6 +164,7 @@ namespace Antimetrics
             _nextReport = Environment.TickCount64 + REP_INTERVAL;
             _reportId = 0;
 
+            _active = true;
             // ETW works quite unstable for PerformanceCounters and MemInfo events, so get them through good old API
             var apiCollector = new Thread(ApiCollector)
             {
@@ -158,13 +179,17 @@ namespace Antimetrics
             etwCollector.Start();
 
             MainWorker();
+
+            _session.Stop();
+            apiCollector.Join();
+            etwCollector.Join();
         }
 
         private void EtwCollector()
         {
-            using (var session = new TraceEventSession("antimetrics"))
+            using (_session = new TraceEventSession("antimetrics"))
             {
-                session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process |
+                _session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process |
                                              KernelTraceEventParser.Keywords.Thread |
                                              KernelTraceEventParser.Keywords.NetworkTCPIP |
                                              KernelTraceEventParser.Keywords.Dispatcher |
@@ -202,7 +227,7 @@ namespace Antimetrics
                     }
                 }
 
-                session.Source.Kernel.ProcessStart += e =>
+                _session.Source.Kernel.ProcessStart += e =>
                 {
                     if (!_monitoredProcesses.TryGetValue(e.ProcessName, out var process))
                         return;
@@ -212,7 +237,7 @@ namespace Antimetrics
                     Console.WriteLine("Process {0} started, new pid {1}", process.Name, e.ProcessID);
                 };
 
-                session.Source.Kernel.ProcessStop += e =>
+                _session.Source.Kernel.ProcessStop += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -226,9 +251,9 @@ namespace Antimetrics
                     process.ConcurrencyCounter = 0;
                 };
 
-                session.Source.Kernel.ThreadStart += e => { };
+                _session.Source.Kernel.ThreadStart += e => { };
 
-                session.Source.Kernel.ThreadStop += e =>
+                _session.Source.Kernel.ThreadStop += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -238,7 +263,7 @@ namespace Antimetrics
                     process.Threads.Remove(e.ThreadID, out _);
                 };
 
-                session.Source.Kernel.FileIORead += e =>
+                _session.Source.Kernel.FileIORead += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -247,7 +272,7 @@ namespace Antimetrics
                     process.ReadCalls += 1;
                 };
 
-                session.Source.Kernel.FileIOWrite += e =>
+                _session.Source.Kernel.FileIOWrite += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -256,7 +281,7 @@ namespace Antimetrics
                     process.WriteCalls += 1;
                 };
 
-                session.Source.Kernel.TcpIpRecv += e =>
+                _session.Source.Kernel.TcpIpRecv += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -265,7 +290,7 @@ namespace Antimetrics
                     process.TcpRecvPackets += 1;
                 };
 
-                session.Source.Kernel.TcpIpSend += e =>
+                _session.Source.Kernel.TcpIpSend += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -274,7 +299,7 @@ namespace Antimetrics
                     process.TcpSentPackets += 1;
                 };
 
-                session.Source.Kernel.UdpIpRecv += e =>
+                _session.Source.Kernel.UdpIpRecv += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -283,7 +308,7 @@ namespace Antimetrics
                     process.UdpRecvPackets += 1;
                 };
 
-                session.Source.Kernel.UdpIpSend += e =>
+                _session.Source.Kernel.UdpIpSend += e =>
                 {
                     if (!_activeProcesses.TryGetValue(e.ProcessID, out var process))
                         return;
@@ -292,7 +317,7 @@ namespace Antimetrics
                     process.UdpSentPackets += 1;
                 };
 
-                session.Source.Kernel.ThreadCSwitch += e =>
+                _session.Source.Kernel.ThreadCSwitch += e =>
                 {
                     var timestamp = (long)(e.TimeStampRelativeMSec * DOUBLE_PRECISION);
                     if (_activeProcesses.TryGetValue(e.OldProcessID, out var oldProcess))
@@ -302,13 +327,13 @@ namespace Antimetrics
                     Interlocked.Exchange(ref _lastSwitchReport, timestamp);
                 };
 
-                session.Source.Process();
+                _session.Source.Process();
             }
         }
 
         private void ApiCollector()
         {
-            for (;;)
+            while (_active)
             {
                 foreach (var process in _monitoredProcesses.Values)
                 {
@@ -319,6 +344,22 @@ namespace Antimetrics
 
                         if ((process.Process == null || process.Process.Id != process.Pid) && !FindProcessByPid(process.Pid, out process.Process))
                             continue;
+
+                        if (_dumpsDirectory != null && (process.Debugger == null || process.Debugger.HasExited))
+                        {
+                            var exeName = $"antidbg.{(Is64Bit(process.Process) ? "x64" : "x86")}.exe";
+                            var exePath = Path.Join(AppContext.BaseDirectory, exeName);
+
+                            process.Debugger = Process.Start(new ProcessStartInfo(exePath, $"{process.Pid} \"path {_dumpsDirectory}\"")
+                            {
+                                RedirectStandardInput = true,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true,
+                            });
+
+                            process.Debugger.OutputDataReceived += DebuggerOnOutputDataReceived;
+                            process.Debugger.BeginOutputReadLine();
+                        }
 
                         process.Process.Refresh();
 
@@ -337,9 +378,15 @@ namespace Antimetrics
             }
         }
 
+        private void DebuggerOnOutputDataReceived(object sender, DataReceivedEventArgs e)
+        {
+            if (_verbose >= 1)
+                Console.WriteLine(e.Data);
+        }
+
         private void MainWorker()
         {
-            for (;;)
+            while (_active)
             {
                 var delta = _nextReport - Environment.TickCount64;
                 if (delta > REP_INTERVAL)
@@ -427,9 +474,10 @@ namespace Antimetrics
                     metrics["working_set"] = process.WorkingSet;
                     metrics["private_memory_size"] = process.PrivateMemorySize;
 
-                    if (_verbose >= 1)
+                    if (_verbose >= 2)
                         Console.WriteLine(string.Join(",", metrics.Select(kv => kv.Key + "=" + kv.Value)));
-                    process.Collector.Write(DB_NAME, metrics);
+
+                    process.Collector?.Write(DB_NAME, metrics);
                 }
 
                 _reportId += 1;
@@ -466,6 +514,20 @@ namespace Antimetrics
                 return false;
             }
         }
+
+        private static bool Is64Bit(Process process)
+        {
+            if (!Environment.Is64BitOperatingSystem)
+                return false;
+
+            if (!IsWow64Process(process.Handle, out bool isWow64))
+                return false;
+
+            return !isWow64;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool IsWow64Process([In] IntPtr process, [Out] out bool wow64Process);
 
         #endregion Methods
     }

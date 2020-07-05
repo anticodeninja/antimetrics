@@ -3,13 +3,12 @@
 // with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
 // Copyright 2020 Artem Yamshanov, me [at] anticode.ninja
 
-namespace Antimetrics
+﻿namespace antidbg64
 {
-    internal class ThreadState
+    using antidbg;
+
+    static class Program
     {
-        public bool Active;
-        public long ReportId;
-        public double TotalTime;
-        public double StartTime;
+        static void Main(string[] args) => new DbgEngine(args).Run();
     }
 }
